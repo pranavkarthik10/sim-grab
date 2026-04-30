@@ -60,6 +60,22 @@ Turn inspect off to interact with the simulator.
 
 ## Quick Start
 
+Run without installing:
+
+```bash
+bunx sim-grab
+```
+
+Then open [http://localhost:7879](http://localhost:7879).
+
+`sim-grab` runs on Bun. Install Bun first if you do not already have it:
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+```
+
+For local development from this repository:
+
 ```bash
 bun install
 bun run dev
@@ -76,14 +92,13 @@ bun run dev:web
 bun run dev:bridge
 ```
 
-Then open [http://localhost:5173](http://localhost:5173).
-
 If the bridge is offline, the web app starts in mock mode automatically.
 
 ## Requirements
 
 For a real simulator session:
 
+- Bun
 - Xcode / `xcrun simctl`
 - a booted iOS Simulator
 - `[idb](https://fbidb.io)` for accessibility inspection and input injection
@@ -98,6 +113,59 @@ pipx install fb-idb
 The bridge will automatically run `idb connect <udid>` for the active simulator target.
 
 Without `idb`, you still get video frames, but not AX inspection or input injection.
+
+## Troubleshooting
+
+### `bun: command not found`
+
+Install Bun, restart your terminal, and run `bunx sim-grab` again.
+
+### `no booted simulator`
+
+Open Simulator.app and boot a device, or run:
+
+```bash
+xcrun simctl boot <udid>
+```
+
+You can list devices with:
+
+```bash
+xcrun simctl list devices
+```
+
+### `idb not found`
+
+Frames can still stream, but inspection and input need `idb`.
+
+```bash
+brew install facebook/fb/idb-companion
+pipx install fb-idb
+```
+
+After installing, restart `sim-grab`.
+
+### Screen recording permission denied
+
+ScreenCaptureKit needs Screen Recording permission for the terminal or process
+that launched `sim-grab`.
+
+Open System Settings → Privacy & Security → Screen Recording, enable permission
+for your terminal app, then restart the terminal and `sim-grab`.
+
+You can also force the slower screenshot fallback:
+
+```bash
+CAPTURE=0 bunx sim-grab
+```
+
+### Port already in use
+
+The bridge uses `7878` and the web UI uses `7879` by default.
+
+```bash
+PORT=8787 SIM_GRAB_WEB_PORT=8788 bunx sim-grab
+```
 
 ## Architecture
 
