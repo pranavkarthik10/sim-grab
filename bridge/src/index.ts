@@ -206,7 +206,7 @@ const server = Bun.serve({
       caps = await detectCapabilities();
       send(ws, {
         type: 'hello',
-        version: '0.3.0',
+        version: '0.1.1',
         deviceId: caps.deviceId,
         capabilities: {
           idb: caps.idb,
