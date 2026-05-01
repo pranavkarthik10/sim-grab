@@ -6,6 +6,7 @@ Open a browser tab, mirror the simulator live, and inspect what is on screen wit
 
 It works with SwiftUI, UIKit, React Native, Flutter, and anything else that surfaces accessibility data inside the simulator.
 
+![Demo](https://raw.githubusercontent.com/pranavkarthik10/lazycal/main/demo.png)
 
 
 ## What It Does
