@@ -47,6 +47,7 @@ function run(label, command, args, options) {
       ...process.env,
       PORT: bridgePort,
       SIM_GRAB_WEB_PORT: webPort,
+      VITE_SIM_GRAB_BRIDGE_PORT: bridgePort,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -109,7 +110,7 @@ process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 
 run('bridge', 'bun', ['run', 'src/index.ts'], { cwd: bridgeDir });
-run('web', 'bun', ['x', 'vite', '--host', '127.0.0.1', '--port', webPort], { cwd: webDir });
+run('web', 'bun', ['x', 'vite', '--host', '127.0.0.1', '--port', webPort, '--strictPort'], { cwd: webDir });
 
 async function ensureCaptureHelper() {
   if (process.env.CAPTURE === '0') return;

@@ -6,6 +6,8 @@ Open a browser tab, mirror the simulator live, and inspect what is on screen wit
 
 It works with SwiftUI, UIKit, React Native, Flutter, and anything else that surfaces accessibility data inside the simulator.
 
+
+
 ## What It Does
 
 - Mirrors a booted iOS Simulator in the browser.
@@ -223,3 +225,4 @@ Environment variables:
 - The underlying AX tree can still collapse some grouped controls, especially complex nav and tab bars.
 - The latent DOM mirror can only expose what the simulator accessibility APIs provide.
 - If `idb` is unavailable or unstable, point inspection and input control will degrade or stop working.
+

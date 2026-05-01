@@ -1,4 +1,7 @@
 import type { AXNode, Snapshot } from '../../shared/protocol';
+import { ensureIdbConnected, runCommandWithTimeout } from './sim';
+
+const IDB_AX_TIMEOUT_MS = 4_000;
 
 // `idb ui describe-all --json` returns a flat array of AX elements for the
 // currently focused app. Each element has a frame in device-pixel coords,
@@ -20,14 +23,26 @@ type RawAX = {
   enabled?: boolean;
 };
 
-export async function captureSnapshot(deviceId: string): Promise<Snapshot | null> {
+export async function captureSnapshot(deviceId: string, udid?: string | null): Promise<Snapshot | null> {
+  return captureSnapshotInner(deviceId, udid, false);
+}
+
+async function captureSnapshotInner(deviceId: string, udid: string | null | undefined, retried: boolean): Promise<Snapshot | null> {
   try {
-    const p = Bun.spawn(['idb', 'ui', 'describe-all', '--json'], {
-      stdout: 'pipe', stderr: 'pipe',
-    });
-    const txt = await new Response(p.stdout).text();
-    await p.exited;
-    if (p.exitCode !== 0) return null;
+    const argv = udid
+      ? ['idb', 'ui', 'describe-all', '--udid', udid, '--json']
+      : ['idb', 'ui', 'describe-all', '--json'];
+    const res = await runCommandWithTimeout(argv, IDB_AX_TIMEOUT_MS);
+    if (res.exitCode !== 0 || res.timedOut) {
+      const err = res.stderr || (res.timedOut ? `timed out after ${IDB_AX_TIMEOUT_MS}ms` : `exit ${res.exitCode}`);
+      if (!retried && shouldReconnectIdb(err)) {
+        await ensureIdbConnected(udid ?? null, true);
+        return captureSnapshotInner(deviceId, udid, true);
+      }
+      console.warn('[bridge] AX snapshot failed:', err.trim() || `exit ${res.exitCode}`);
+      return null;
+    }
+    const txt = res.stdout;
     const raw = JSON.parse(txt) as RawAX[];
     return normalize(raw, deviceId);
   } catch {
@@ -35,25 +50,39 @@ export async function captureSnapshot(deviceId: string): Promise<Snapshot | null
   }
 }
 
-export async function describePoint(x: number, y: number): Promise<AXNode | null> {
+export async function describePoint(x: number, y: number, udid?: string | null): Promise<AXNode | null> {
+  return describePointInner(x, y, udid, false);
+}
+
+async function describePointInner(x: number, y: number, udid: string | null | undefined, retried: boolean): Promise<AXNode | null> {
   try {
-    const p = Bun.spawn([
+    const res = await runCommandWithTimeout([
       'idb', 'ui', 'describe-point',
+      ...(udid ? ['--udid', udid] : []),
       String(Math.round(x)),
       String(Math.round(y)),
       '--json',
-    ], {
-      stdout: 'pipe', stderr: 'pipe',
-    });
-    const txt = await new Response(p.stdout).text();
-    await p.exited;
-    if (p.exitCode !== 0) return null;
+    ], IDB_AX_TIMEOUT_MS);
+    if (res.exitCode !== 0 || res.timedOut) {
+      const err = res.stderr || (res.timedOut ? `timed out after ${IDB_AX_TIMEOUT_MS}ms` : `exit ${res.exitCode}`);
+      if (!retried && shouldReconnectIdb(err)) {
+        await ensureIdbConnected(udid ?? null, true);
+        return describePointInner(x, y, udid, true);
+      }
+      console.warn('[bridge] AX point inspect failed:', err.trim() || `exit ${res.exitCode}`);
+      return null;
+    }
+    const txt = res.stdout;
     const raw = JSON.parse(txt) as RawAX | RawAX[] | null;
     const node = Array.isArray(raw) ? raw[0] : raw;
     return node ? normalizeNode(node, 0) : null;
   } catch {
     return null;
   }
+}
+
+function shouldReconnectIdb(err: string): boolean {
+  return /Connection refused|Failed to connect to companion|companion.*sock|not connected|not booted|timed out/i.test(err);
 }
 
 function normalize(raw: RawAX[], deviceId: string): Snapshot {

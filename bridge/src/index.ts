@@ -26,10 +26,15 @@ const CAPTURE_MAX_WIDTH = Number(process.env.CAPTURE_MAX_WIDTH ?? 1200);
 // Useful when the user hasn't granted Screen Recording permission yet.
 const CAPTURE_DISABLE = process.env.CAPTURE === '0';
 
-let caps = await detectCapabilities();
+let selectedUdid: string | null = null;
+let caps = await detectCapabilities(selectedUdid);
+selectedUdid = caps.udid;
 const hasCaptureBin = captureAvailable();
-const captureCap = !CAPTURE_DISABLE && hasCaptureBin && caps.simctl && caps.booted;
-logCaps(caps, captureCap, hasCaptureBin);
+logCaps(caps, canUseCaptureKit(), hasCaptureBin);
+
+function canUseCaptureKit() {
+  return !CAPTURE_DISABLE && hasCaptureBin && caps.simctl && caps.booted;
+}
 
 function logCaps(c: typeof caps, cap: boolean, binPresent: boolean) {
   console.log('[bridge] capabilities:', { ...c, capturekit: cap });
@@ -59,17 +64,34 @@ function broadcastBinary(tag: number, data: Uint8Array) {
   for (const ws of sockets) { try { sendBinary(ws, tag, data); } catch { /* dropped */ } }
 }
 
+function hello(): BridgeMsg {
+  return {
+    type: 'hello',
+    version: '0.1.1',
+    deviceId: caps.deviceId,
+    capabilities: {
+      idb: caps.idb,
+      simctl: caps.simctl,
+      booted: caps.booted,
+      devices: caps.devices,
+      selectedUdid: caps.udid,
+      capturekit: canUseCaptureKit(),
+      videoTransport: videoTransport(),
+    },
+  };
+}
+
 // ---------- snapshot refresh (async + deduped) ----------
 
 let refreshInFlight: Promise<void> | null = null;
 let refreshPending = false;
 
 async function refreshAll(): Promise<void> {
-  if (!caps.idb) return;
+  if (!caps.idb || !caps.booted) return;
   if (refreshInFlight) { refreshPending = true; return refreshInFlight; }
   refreshInFlight = (async () => {
     try {
-      const snap = await captureSnapshot(caps.deviceId);
+      const snap = await captureSnapshot(caps.deviceId, caps.udid);
       if (snap) broadcastJson({ type: 'snapshot', data: snap });
     } finally {
       refreshInFlight = null;
@@ -104,8 +126,13 @@ function switchTransport(to: VideoTransport) {
   }
 }
 
+function ensureVideoRunning() {
+  if (activeTransport !== 'none' || !caps.booted) return;
+  if (!startCaptureKit()) startScreenshots();
+}
+
 function startCaptureKit() {
-  if (!captureCap) return false;
+  if (!canUseCaptureKit()) return false;
   console.log(`[bridge] starting ScreenCaptureKit @ ${CAPTURE_FPS}fps q=${CAPTURE_QUALITY} maxW=${CAPTURE_MAX_WIDTH}`);
   const handle = startCapture(
     { fps: CAPTURE_FPS, quality: CAPTURE_QUALITY, maxWidth: CAPTURE_MAX_WIDTH },
@@ -132,6 +159,7 @@ function startCaptureKit() {
     },
   );
   capture = handle;
+  activeTransport = 'capturekit';
   // pulseFrames is a no-op under SCK — frames stream at 50fps already
   pulseFrames = () => {};
   return true;
@@ -147,12 +175,13 @@ function stopCapture() {
 }
 
 function startScreenshots() {
-  if (!caps.simctl || screenshotLoop) return;
-  console.log(`[bridge] starting ${FRAME_FORMAT} screenshot loop @ ${FRAME_MS}ms`);
+  if (!caps.simctl || !caps.booted || screenshotLoop) return;
+  console.log(`[bridge] starting ${FRAME_FORMAT} screenshot loop @ ${FRAME_MS}ms for ${caps.udid ?? 'booted'}`);
   const loop = startScreenshotLoop(
     FRAME_MS,
     (buf) => broadcastBinary(BIN_TAG_IMAGE, buf),
     FRAME_FORMAT,
+    caps.udid,
   );
   screenshotLoop = loop;
   pulseFrames = loop.pulse;
@@ -203,22 +232,13 @@ const server = Bun.serve({
       sockets.add(ws);
       // Re-detect on every new client so the user never has to restart
       // the bridge after installing idb, booting a sim, etc.
-      caps = await detectCapabilities();
-      send(ws, {
-        type: 'hello',
-        version: '0.1.1',
-        deviceId: caps.deviceId,
-        capabilities: {
-          idb: caps.idb,
-          simctl: caps.simctl,
-          booted: caps.booted,
-          capturekit: activeTransport === 'capturekit',
-          videoTransport: videoTransport(),
-        },
-      });
+      caps = await detectCapabilities(selectedUdid);
+      selectedUdid = caps.udid;
+      ensureVideoRunning();
+      send(ws, hello());
       if (lastMeta) send(ws, lastMeta);
-      if (caps.idb) {
-        const snap = await captureSnapshot(caps.deviceId);
+      if (caps.idb && caps.booted) {
+        const snap = await captureSnapshot(caps.deviceId, caps.udid);
         if (snap) send(ws, { type: 'snapshot', data: snap });
       }
     },
@@ -232,38 +252,53 @@ const server = Bun.serve({
           case 'video:transport':
             switchTransport(msg.transport);
             break;
+          case 'device:select':
+            selectedUdid = msg.udid;
+            caps = await detectCapabilities(selectedUdid);
+            selectedUdid = caps.udid;
+            switchTransport(activeTransport === 'capturekit' ? 'capturekit' : 'screenshot');
+            ensureVideoRunning();
+            broadcastJson(hello());
+            void refreshAll();
+            break;
           case 'inspect:refresh': {
-            const snap = await captureSnapshot(caps.deviceId);
+            if (!caps.booted) throw new Error('no booted simulator');
+            const snap = await captureSnapshot(caps.deviceId, caps.udid);
             if (snap) send(ws, { type: 'snapshot', data: snap });
             break;
           }
           case 'inspect:point': {
+            if (!caps.booted) throw new Error('no booted simulator');
             if (!caps.idb) throw new Error('idb not installed');
-            const node = await describePoint(msg.x, msg.y);
+            const node = await describePoint(msg.x, msg.y, caps.udid);
             send(ws, { type: 'inspect:point', requestId: msg.requestId, x: msg.x, y: msg.y, node });
             break;
           }
           case 'hid:tap':
+            if (!caps.booted) throw new Error('no booted simulator');
             if (!caps.idb) throw new Error('idb not installed');
-            await idbTap(msg.x, msg.y);
+            await idbTap(msg.x, msg.y, caps.udid);
             pulseFrames();
             void refreshAll();
             break;
           case 'hid:swipe':
+            if (!caps.booted) throw new Error('no booted simulator');
             if (!caps.idb) throw new Error('idb not installed');
-            await idbSwipe(msg.x1, msg.y1, msg.x2, msg.y2, msg.durationMs);
+            await idbSwipe(msg.x1, msg.y1, msg.x2, msg.y2, msg.durationMs, caps.udid);
             pulseFrames();
             void refreshAll();
             break;
           case 'hid:text':
+            if (!caps.booted) throw new Error('no booted simulator');
             if (!caps.idb) throw new Error('idb not installed');
-            await idbText(msg.text);
+            await idbText(msg.text, caps.udid);
             pulseFrames();
             void refreshAll();
             break;
           case 'hid:key':
+            if (!caps.booted) throw new Error('no booted simulator');
             if (!caps.idb) throw new Error('idb not installed');
-            await idbKey(msg.key);
+            await idbKey(msg.key, caps.udid);
             pulseFrames();
             void refreshAll();
             break;
@@ -282,9 +317,9 @@ console.log(`[bridge] listening on http://localhost:${server.port} (ws /ws)`);
 
 // Start capture AFTER the server is listening so clients can connect
 // and we can fall back cleanly if capture never produces frames.
-if (captureCap) {
+if (canUseCaptureKit()) {
   const started = startCaptureKit();
   if (!started) startScreenshots();
-} else if (caps.simctl) {
+} else if (caps.simctl && caps.booted) {
   startScreenshots();
 }

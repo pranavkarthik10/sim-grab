@@ -3,6 +3,23 @@
 // log once and return null so the bridge can still serve what it has.
 
 const enc = new TextEncoder();
+const IDB_CONNECT_TIMEOUT_MS = 3_000;
+const IDB_UI_TIMEOUT_MS = 4_000;
+
+export type ProcessResult = {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+};
+
+export type SimDevice = {
+  udid: string;
+  name: string;
+  state: string;
+  runtime: string;
+  lastBootedAt: string | null;
+};
 
 async function which(cmd: string): Promise<boolean> {
   try {
@@ -18,13 +35,15 @@ export type Capabilities = {
   booted: boolean;
   deviceId: string;
   udid: string | null;
+  devices: SimDevice[];
 };
 
-export async function detectCapabilities(): Promise<Capabilities> {
+export async function detectCapabilities(preferredUdid?: string | null): Promise<Capabilities> {
   const [idb, simctl] = await Promise.all([which('idb'), which('xcrun')]);
   let booted = false;
   let deviceId = 'booted';
   let udid: string | null = null;
+  let devices: SimDevice[] = [];
   if (simctl) {
     try {
       const p = Bun.spawn(['xcrun', 'simctl', 'list', 'devices', 'booted', '-j'], {
@@ -32,15 +51,25 @@ export async function detectCapabilities(): Promise<Capabilities> {
       });
       const txt = await new Response(p.stdout).text();
       await p.exited;
-      const json = JSON.parse(txt) as { devices: Record<string, Array<{ udid: string; state: string; name: string }>> };
-      for (const devs of Object.values(json.devices)) {
-        const b = devs.find(d => d.state === 'Booted');
-        if (b) {
-          booted = true;
-          udid = b.udid;
-          deviceId = `${b.name} (${b.udid.slice(0, 8)}…)`;
-          break;
-        }
+      const json = JSON.parse(txt) as {
+        devices: Record<string, Array<{ udid: string; state: string; name: string; lastBootedAt?: string }>>;
+      };
+      devices = Object.entries(json.devices)
+        .flatMap(([runtime, devs]) => devs
+          .filter((d) => d.state === 'Booted')
+          .map((d) => ({
+            udid: d.udid,
+            name: d.name,
+            state: d.state,
+            runtime,
+            lastBootedAt: d.lastBootedAt ?? null,
+          })))
+        .sort((a, b) => (b.lastBootedAt ?? '').localeCompare(a.lastBootedAt ?? ''));
+      const selected = devices.find((d) => d.udid === preferredUdid) ?? devices[0] ?? null;
+      if (selected) {
+        booted = true;
+        udid = selected.udid;
+        deviceId = `${selected.name} (${selected.udid.slice(0, 8)}…)`;
       }
     } catch { /* ignore */ }
   }
@@ -49,15 +78,29 @@ export async function detectCapabilities(): Promise<Capabilities> {
   // BUT: if the idb companion is wedged (seen this several times after
   // killing `idb video-stream`), `idb connect` hangs forever and takes the
   // whole bridge down. Race it against a 3s deadline and move on.
-  if (idb && booted && udid) {
-    const p = Bun.spawn(['idb', 'connect', udid], { stdout: 'pipe', stderr: 'pipe' });
-    const deadline = new Promise<void>((res) => setTimeout(() => {
-      try { p.kill('SIGKILL'); } catch { /* ignore */ }
-      res();
-    }, 3000));
-    await Promise.race([p.exited.then(() => {}), deadline]);
+  if (idb && booted && udid) await ensureIdbConnected(udid);
+  return { idb, simctl, booted, deviceId, udid, devices };
+}
+
+export async function ensureIdbConnected(udid: string | null, force = false): Promise<void> {
+  if (!udid) return;
+  if (force) {
+    await runIdbConnectCommand(['idb', 'disconnect', udid]);
+    await killIdbCompanion(udid);
   }
-  return { idb, simctl, booted, deviceId, udid };
+  await runIdbConnectCommand(['idb', 'connect', udid]);
+}
+
+async function runIdbConnectCommand(argv: string[]): Promise<void> {
+  await runCommandWithTimeout(argv, IDB_CONNECT_TIMEOUT_MS);
+}
+
+async function killIdbCompanion(udid: string): Promise<void> {
+  try {
+    await runCommandWithTimeout(['pkill', '-f', `idb_companion --udid ${udid}`], 1_000);
+  } catch {
+    // Best-effort cleanup. `pkill` exits non-zero when nothing matched.
+  }
 }
 
 export type FrameFormat = 'jpeg' | 'png';
@@ -68,9 +111,10 @@ export type FrameFormat = 'jpeg' | 'png';
  * so it's the default for the stream. PNG stays available for anything
  * that needs lossless (e.g. pixel-diff-based frame invalidation later).
  */
-export async function screenshot(format: FrameFormat = 'jpeg'): Promise<Uint8Array | null> {
+export async function screenshot(format: FrameFormat = 'jpeg', udid?: string | null): Promise<Uint8Array | null> {
   try {
-    const p = Bun.spawn(['xcrun', 'simctl', 'io', 'booted', 'screenshot', `--type=${format}`, '-'], {
+    const target = udid ?? 'booted';
+    const p = Bun.spawn(['xcrun', 'simctl', 'io', target, 'screenshot', `--type=${format}`, '-'], {
       stdout: 'pipe', stderr: 'ignore',
     });
     const buf = await new Response(p.stdout).arrayBuffer();
@@ -91,13 +135,14 @@ export function startScreenshotLoop(
   intervalMs: number,
   onFrame: (data: Uint8Array) => void,
   format: FrameFormat = 'jpeg',
+  udid?: string | null,
 ): { stop: () => void; pulse: () => void } {
   let stopped = false;
   let wake: (() => void) | null = null;
   (async () => {
     while (!stopped) {
       const t0 = Date.now();
-      const buf = await screenshot(format);
+      const buf = await screenshot(format, udid);
       if (buf) onFrame(buf);
       const dt = Date.now() - t0;
       const wait = Math.max(0, intervalMs - dt);
@@ -115,37 +160,83 @@ export function startScreenshotLoop(
 
 // ---------- HID (requires idb) ----------
 
-export async function idbTap(x: number, y: number): Promise<void> {
-  await run(['idb', 'ui', 'tap', String(Math.round(x)), String(Math.round(y))]);
+export async function idbTap(x: number, y: number, udid?: string | null): Promise<void> {
+  await run(withUdid(['idb', 'ui', 'tap'], udid, [String(Math.round(x)), String(Math.round(y))]), udid);
 }
 
 export async function idbSwipe(
-  x1: number, y1: number, x2: number, y2: number, durationMs = 200,
+  x1: number, y1: number, x2: number, y2: number, durationMs = 200, udid?: string | null,
 ): Promise<void> {
-  await run([
+  await run(withUdid([
     'idb', 'ui', 'swipe',
     '--duration', String(Math.max(0.05, durationMs / 1000)),
+  ], udid, [
     String(Math.round(x1)), String(Math.round(y1)),
     String(Math.round(x2)), String(Math.round(y2)),
-  ]);
+  ]), udid);
 }
 
-export async function idbText(text: string): Promise<void> {
-  await run(['idb', 'ui', 'text', text]);
+export async function idbText(text: string, udid?: string | null): Promise<void> {
+  await run(withUdid(['idb', 'ui', 'text'], udid, [text]), udid);
 }
 
-export async function idbKey(key: 'home' | 'lock' | 'volumeUp' | 'volumeDown'): Promise<void> {
+export async function idbKey(key: 'home' | 'lock' | 'volumeUp' | 'volumeDown', udid?: string | null): Promise<void> {
   const map = { home: 'HOME', lock: 'LOCK', volumeUp: 'VOLUME_UP', volumeDown: 'VOLUME_DOWN' } as const;
-  await run(['idb', 'ui', 'button', map[key]]);
+  await run(withUdid(['idb', 'ui', 'button'], udid, [map[key]]), udid);
 }
 
-async function run(argv: string[]): Promise<void> {
-  const p = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
-  await p.exited;
-  if (p.exitCode !== 0) {
-    const err = await new Response(p.stderr).text();
-    throw new Error(`${argv[0]} ${argv[1] ?? ''} failed: ${err.trim() || `exit ${p.exitCode}`}`);
+function withUdid(prefix: string[], udid: string | null | undefined, suffix: string[]): string[] {
+  return udid ? [...prefix, '--udid', udid, ...suffix] : [...prefix, ...suffix];
+}
+
+async function run(argv: string[], udid?: string | null, retried = false): Promise<void> {
+  const res = await runCommandWithTimeout(argv, IDB_UI_TIMEOUT_MS);
+  if (res.exitCode !== 0 || res.timedOut) {
+    const err = res.stderr.trim() || (res.timedOut ? `timed out after ${IDB_UI_TIMEOUT_MS}ms` : `exit ${res.exitCode}`);
+    if (!retried && shouldReconnectIdb(err)) {
+      await ensureIdbConnected(udid ?? null, true);
+      return run(argv, udid, true);
+    }
+    throw new Error(`${argv[0]} ${argv[1] ?? ''} failed: ${err}`);
   }
+}
+
+export async function runCommandWithTimeout(argv: string[], timeoutMs: number): Promise<ProcessResult> {
+  const p = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let settled = false;
+
+  const completed = (async (): Promise<ProcessResult> => {
+    const [stdout, stderr] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+      p.exited.then(() => ''),
+    ]);
+    settled = true;
+    if (timer) clearTimeout(timer);
+    return { exitCode: p.exitCode, stdout, stderr, timedOut: false };
+  })();
+
+  const deadline = new Promise<ProcessResult>((resolve) => {
+    timer = setTimeout(() => {
+      if (settled) return;
+      try { p.kill('SIGKILL'); } catch { /* already gone */ }
+      resolve({
+        exitCode: null,
+        stdout: '',
+        stderr: `timed out after ${timeoutMs}ms`,
+        timedOut: true,
+      });
+    }, timeoutMs);
+  });
+
+  const result = await Promise.race([completed, deadline]);
+  if (result.timedOut) completed.catch(() => {});
+  return result;
+}
+
+function shouldReconnectIdb(err: string): boolean {
+  return /Connection refused|Failed to connect to companion|companion.*sock|not connected|not booted|timed out/i.test(err);
 }
 
 // silence the TS unused warning from `enc` — reserved for future ws helpers

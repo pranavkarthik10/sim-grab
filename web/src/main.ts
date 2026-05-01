@@ -22,6 +22,7 @@ const refreshBtn = $<HTMLButtonElement>('refreshBtn');
 const homeBtn = $<HTMLButtonElement>('homeBtn');
 const copyScreenshotBtn = $<HTMLButtonElement>('copyScreenshotBtn');
 const includeScreenshotEl = $<HTMLInputElement>('includeScreenshot');
+const deviceSel = $<HTMLSelectElement>('deviceSel');
 const transportSel = $<HTMLSelectElement>('transportSel');
 const axDomLayer = $('axDomLayer');
 const axDomViewport = $('axDomViewport');
@@ -58,7 +59,9 @@ setSource('mock');
 deviceEl.textContent = snapshot.deviceId;
 
 // ---------- bridge ----------
-const wsUrl = `ws://${location.hostname || 'localhost'}:7878/ws`;
+const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
+const bridgePort = viteEnv?.VITE_SIM_GRAB_BRIDGE_PORT || '7878';
+const wsUrl = `ws://${location.hostname || 'localhost'}:${bridgePort}/ws`;
 let liveFrameUrl: string | null = null;
 let hasRealFrames = false;
 let hasRealTree = false;
@@ -68,11 +71,13 @@ let lastHelloTransport: 'capturekit' | 'screenshot' | 'none' = 'none';
 let pointInspectSeq = 0;
 let selectedPointInspectSeq = 0;
 let lastCopiedContext = '';
+let lastAxDomRenderKey = '';
 
 const bridge = new BridgeClient(wsUrl, {
   onHello: (msg) => {
     deviceEl.textContent = msg.deviceId;
     const { idb, simctl, booted, videoTransport } = msg.capabilities;
+    renderDeviceOptions(msg.capabilities.devices, msg.capabilities.selectedUdid);
     clearMockState();
     if (!booted) setStatus('err', 'no booted simulator');
     else if (!idb && simctl) setStatus('live', 'frames only — install idb for inspector');
@@ -151,6 +156,7 @@ function clearMockState() {
   clearSelection();
   hovered = [];
   axDomViewport.innerHTML = '';
+  lastAxDomRenderKey = '';
   overlay.showHover(null);
   setSource('none');
 }
@@ -205,10 +211,9 @@ function selectNode(node: AXNode, path = pathForNode(node)) {
 }
 
 function selectOrToggleNode(node: AXNode, path = pathForNode(node)) {
-  if (selected && sameNode(selected, node)) {
-    clearSelection();
-    return;
-  }
+  // Selection should be idempotent. A stale selected node can survive an AX
+  // refresh; toggling it off on the next click makes the UI feel like it
+  // randomly needs a second click.
   selectNode(node, path);
 }
 
@@ -222,14 +227,24 @@ function updateAutoTransport() {
 }
 
 function renderAxDom() {
-  axDomViewport.innerHTML = '';
   if (frameImg.naturalWidth <= 0 || frameImg.naturalHeight <= 0) return;
   const viewport = overlay.getOverlayContentRect();
+  const renderKey = [
+    snapshot.capturedAt,
+    snapshot.nodes.length,
+    `${snapshot.simSize.w}x${snapshot.simSize.h}`,
+    `${frameImg.naturalWidth}x${frameImg.naturalHeight}`,
+    `${Math.round(viewport.x * 10)},${Math.round(viewport.y * 10)},${Math.round(viewport.w * 10)},${Math.round(viewport.h * 10)}`,
+  ].join('|');
+  if (renderKey === lastAxDomRenderKey) return;
+  lastAxDomRenderKey = renderKey;
+  axDomViewport.innerHTML = '';
   axDomViewport.style.left = `${viewport.x}px`;
   axDomViewport.style.top = `${viewport.y}px`;
   axDomViewport.style.width = `${viewport.w}px`;
   axDomViewport.style.height = `${viewport.h}px`;
-  for (const node of snapshot.nodes) {
+  const nodes = [...snapshot.nodes].sort((a, b) => area(b.frame) - area(a.frame));
+  for (const node of nodes) {
     if (node.frame.w <= 0 || node.frame.h <= 0) continue;
     const el = document.createElement('div');
     const label = bestLabel(node);
@@ -261,15 +276,32 @@ function renderAxDom() {
     el.setAttribute('aria-description', context);
     el.title = context;
     el.textContent = spoken;
-    el.addEventListener('click', (e) => {
+    el.addEventListener('mousemove', (e) => {
+      if (!inspectMode || frozen) return;
+      e.stopPropagation();
+      previewNode(node, path);
+    });
+    el.addEventListener('mouseleave', (e) => {
+      if (!inspectMode || frozen) return;
+      e.stopPropagation();
+      hovered = [];
+      overlay.showHover(null);
+      if (!selected) renderSelectedPreview(null, []);
+    });
+    el.addEventListener('pointerdown', (e) => {
+      if (!inspectMode) return;
+      e.preventDefault();
       e.stopPropagation();
       selectOrToggleNode(node, path);
-      if (selected) {
-        requestPointInspect({
-          x: node.frame.x + node.frame.w / 2,
-          y: node.frame.y + node.frame.h / 2,
-        });
+    });
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (inspectMode) {
+        e.preventDefault();
+        return;
       }
+      const p = overlay.hitPoint(e);
+      if (p) bridge.send({ type: 'hid:tap', x: p.x, y: p.y });
     });
     axDomViewport.appendChild(el);
   }
@@ -288,8 +320,7 @@ screenEl.addEventListener('mousemove', (e) => {
   }
   hovered = hitTest(snapshot.nodes, p.x, p.y);
   const deepest = hovered.at(-1) ?? null;
-  overlay.showHover(deepest);
-  renderSelectedPreview(deepest, hovered);
+  previewNode(deepest, hovered);
 });
 
 screenEl.addEventListener('mouseleave', () => {
@@ -317,6 +348,12 @@ screenEl.addEventListener('click', (e) => {
     bridge.send({ type: 'hid:tap', x: p.x, y: p.y });
   }
 });
+
+function previewNode(node: AXNode | null, path: AXNode[]) {
+  hovered = path;
+  overlay.showHover(node);
+  renderSelectedPreview(node, path);
+}
 
 // ---------- wheel → swipe (scroll passthrough) ----------
 // Mouse wheel / trackpad scroll over the sim maps to `idb ui swipe`.
@@ -450,12 +487,39 @@ copyScreenshotBtn.addEventListener('click', () => {
 floatingCopyScreenshotBtn.addEventListener('click', () => {
   void copyScreenshot();
 });
+deviceSel.addEventListener('change', () => {
+  if (!deviceSel.value) return;
+  bridge.send({ type: 'device:select', udid: deviceSel.value });
+});
 transportSel.addEventListener('change', () => {
   const v = transportSel.value as typeof transportPref;
   transportPref = v;
   if (v === 'auto') return;
   bridge.send({ type: 'video:transport', transport: v });
 });
+
+function renderDeviceOptions(
+  devices: Array<{ udid: string; name: string; runtime: string; lastBootedAt: string | null }>,
+  selectedUdid: string | null,
+) {
+  deviceSel.innerHTML = '';
+  if (!devices.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No booted simulator';
+    deviceSel.appendChild(opt);
+    deviceSel.disabled = true;
+    return;
+  }
+  deviceSel.disabled = false;
+  for (const device of devices) {
+    const opt = document.createElement('option');
+    opt.value = device.udid;
+    opt.textContent = `${device.name} (${device.udid.slice(0, 8)})`;
+    deviceSel.appendChild(opt);
+  }
+  deviceSel.value = selectedUdid ?? devices[0]!.udid;
+}
 
 // ---------- sidebar visibility ----------
 const AUTO_NARROW_PX = 760;

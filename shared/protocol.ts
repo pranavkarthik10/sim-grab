@@ -27,11 +27,20 @@ export type Snapshot = {
   source: 'idb' | 'mock' | 'none';
 };
 
+export type SimDevice = {
+  udid: string;
+  name: string;
+  state: string;
+  runtime: string;
+  lastBootedAt: string | null;
+};
+
 // Client → Bridge
 export type ClientMsg =
   | { type: 'inspect:refresh' }
   | { type: 'inspect:point'; x: number; y: number; requestId: number }
   | { type: 'video:transport'; transport: VideoTransport }
+  | { type: 'device:select'; udid: string }
   | { type: 'hid:tap'; x: number; y: number }
   | { type: 'hid:swipe'; x1: number; y1: number; x2: number; y2: number; durationMs?: number }
   | { type: 'hid:text'; text: string }
@@ -58,6 +67,8 @@ export type Capabilities = {
   idb: boolean;      // idb installed → AX + taps available
   simctl: boolean;   // simctl installed → screenshot fallback available
   booted: boolean;   // a sim is currently booted
+  devices: SimDevice[];
+  selectedUdid: string | null;
   capturekit: boolean; // ScreenCaptureKit sidecar built and runnable
   videoTransport: VideoTransport;
 };
