@@ -2,22 +2,47 @@
 
 `sim-grab` turns the iOS Simulator into something an agent can actually work with.
 
-Open a browser tab, mirror the simulator live, and inspect what is on screen with real accessibility metadata: labels, roles, frames, ancestor chains, and point-level refinement when the screen dump is too coarse. It is built for coding workflows where you want an AI assistant to understand a running app without adding instrumentation to the app itself.
+Run one command, open a browser tab, mirror the simulator live, and inspect the screen with real accessibility metadata: labels, roles, frames, ancestor chains, and point-level refinement when the accessibility tree is too coarse. It is built for coding workflows where you want an AI assistant to understand a running app without adding instrumentation to the app.
 
-It works with SwiftUI, UIKit, React Native, Flutter, and anything else that surfaces accessibility data inside the simulator.
+It works with SwiftUI, UIKit, React Native, Flutter, and anything else that exposes accessibility data inside the simulator.
 
 ![Demo](https://raw.githubusercontent.com/pranavkarthik10/sim-grab/main/demo.png)
 
+## Quick Start
+
+Run without installing:
+
+```bash
+npx sim-grab
+```
+
+Then open [http://localhost:7879](http://localhost:7879).
+
+For a real simulator session, you need:
+
+- Node.js 18+
+- Xcode / `xcrun simctl`
+- a booted iOS Simulator
+- [`idb`](https://fbidb.io) for accessibility inspection and input injection
+
+Install `idb` with:
+
+```bash
+brew install facebook/fb/idb-companion
+pipx install fb-idb
+```
+
+Without `idb`, `sim-grab` can still stream video frames, but inspection and input control are limited.
 
 ## What It Does
 
 - Mirrors a booted iOS Simulator in the browser.
 - Lets you inspect on-screen elements through the accessibility tree.
-- Refines selections with point-based lookup when needed.
-- Automatically copies an agent-ready context block when you select an element.
+- Refines selections with point-based lookup when the flat tree is ambiguous.
+- Copies an agent-ready context block when you select an element.
 - Supports pass-through taps, swipes, text input, and hardware-style buttons.
-- Mirrors the AX tree into latent DOM nodes so tools like Cursor’s picker can target simulator elements from the page DOM.
-- Falls back to mock mode when no simulator or bridge is connected, so you can still demo the UI.
+- Mirrors the AX tree into latent DOM nodes so browser-based tools can target simulator elements from the page DOM.
+- Falls back to mock mode when no simulator or bridge is connected, so the UI can still be demoed.
 
 ## Why It Exists
 
@@ -42,14 +67,24 @@ Use `Inspect` when you want hover highlighting, selection, and the component sta
 
 ### Interaction mode
 
-Turn inspect off to interact with the simulator.
+Turn Inspect off to interact with the simulator.
 
 - Click sends a tap.
 - Mouse drag sends a swipe.
 - Wheel scrolling sends a coalesced swipe for list navigation.
 
-## Keyboard Shortcuts
+## Video Transport
 
+`sim-grab` uses two video paths:
+
+- ScreenCaptureKit for smooth live viewing.
+- `simctl` screenshots during Inspect mode for tighter AX/frame alignment.
+
+In `Auto` video mode, Inspect uses `simctl`, and Interaction mode returns to a warm ScreenCaptureKit stream when available. If ScreenCaptureKit cannot start, `sim-grab` falls back to `simctl` screenshots.
+
+You can force `CaptureKit` or `simctl` from the UI.
+
+## Keyboard Shortcuts
 
 | Key            | Action                          |
 | -------------- | ------------------------------- |
@@ -60,24 +95,33 @@ Turn inspect off to interact with the simulator.
 | `Cmd` / `Ctrl` | Freeze current hover while held |
 | `Shift + I`    | Hide or show the sidebar        |
 
+## Configuration
 
-## Quick Start
+Common runtime variables:
 
-Run without installing:
+| Var                           | Default | Purpose                                      |
+| ----------------------------- | ------- | -------------------------------------------- |
+| `PORT`                        | `7878`  | Bridge WebSocket / health port               |
+| `SIM_GRAB_WEB_PORT`           | `7879`  | Browser UI port                              |
+| `CAPTURE=0`                   | unset   | Disable ScreenCaptureKit                     |
+| `CAPTURE_FPS`                 | `50`    | Target ScreenCaptureKit frame rate           |
+| `CAPTURE_QUALITY`             | `0.7`   | JPEG quality for ScreenCaptureKit frames     |
+| `CAPTURE_MAX_WIDTH`           | `1200`  | Max streamed ScreenCaptureKit frame width    |
+| `CAPTURE_RESTART_LIMIT`       | `6`     | CaptureKit restart attempts per window       |
+| `CAPTURE_RESTART_WINDOW_MS`   | `30000` | Restart accounting window                    |
+| `CAPTURE_RESTART_DELAY_MS`    | `650`   | Delay before restarting CaptureKit           |
+| `CAPTURE_WINDOW_ATTEMPTS`     | `40`    | Swift helper window lookup attempts          |
+| `CAPTURE_WINDOW_RETRY_MS`     | `100`   | Swift helper window lookup retry delay       |
+| `FRAME_MS`                    | `120`   | Screenshot cadence for the `simctl` fallback |
+| `FRAME_FORMAT`                | `jpeg`  | Screenshot encoding: `jpeg` or `png`         |
+
+Example:
 
 ```bash
-bunx sim-grab
+PORT=8787 SIM_GRAB_WEB_PORT=8788 npx sim-grab
 ```
 
-Then open [http://localhost:7879](http://localhost:7879).
-
-`sim-grab` runs on Bun. Install Bun first if you do not already have it:
-
-```bash
-curl -fsSL https://bun.sh/install | bash
-```
-
-For local development from this repository:
+## Local Development
 
 ```bash
 bun install
@@ -87,7 +131,6 @@ bun run dev
 Or run the two sides separately:
 
 ```bash
-
 # Terminal 1
 bun run dev:web
 
@@ -95,135 +138,8 @@ bun run dev:web
 bun run dev:bridge
 ```
 
-If the bridge is offline, the web app starts in mock mode automatically.
+The published CLI runs on Node and serves built assets from `web/dist`. The development workflow still uses Bun and Vite for fast iteration.
 
-## Requirements
+## More
 
-For a real simulator session:
-
-- Bun
-- Xcode / `xcrun simctl`
-- a booted iOS Simulator
-- `[idb](https://fbidb.io)` for accessibility inspection and input injection
-
-Install `idb` with:
-
-```bash
-brew install facebook/fb/idb-companion
-pipx install fb-idb
-```
-
-The bridge will automatically run `idb connect <udid>` for the active simulator target.
-
-Without `idb`, you still get video frames, but not AX inspection or input injection.
-
-## Troubleshooting
-
-### `bun: command not found`
-
-Install Bun, restart your terminal, and run `bunx sim-grab` again.
-
-### `no booted simulator`
-
-Open Simulator.app and boot a device, or run:
-
-```bash
-xcrun simctl boot <udid>
-```
-
-You can list devices with:
-
-```bash
-xcrun simctl list devices
-```
-
-### `idb not found`
-
-Frames can still stream, but inspection and input need `idb`.
-
-```bash
-brew install facebook/fb/idb-companion
-pipx install fb-idb
-```
-
-After installing, restart `sim-grab`.
-
-### Screen recording permission denied
-
-ScreenCaptureKit needs Screen Recording permission for the terminal or process
-that launched `sim-grab`.
-
-Open System Settings → Privacy & Security → Screen Recording, enable permission
-for your terminal app, then restart the terminal and `sim-grab`.
-
-On first run, `sim-grab` builds a small local ScreenCaptureKit helper from the
-Swift source included in the package. If that build fails, the bridge falls back
-to slower `simctl` screenshots.
-
-You can also force the slower screenshot fallback:
-
-```bash
-CAPTURE=0 bunx sim-grab
-```
-
-### Port already in use
-
-The bridge uses `7878` and the web UI uses `7879` by default.
-
-```bash
-PORT=8787 SIM_GRAB_WEB_PORT=8788 bunx sim-grab
-```
-
-## Architecture
-
-`sim-grab` has two pieces:
-
-- `web/`: the browser UI, built with Vite + TypeScript
-- `bridge/`: a Bun websocket bridge that talks to `simctl`, `idb`, and ScreenCaptureKit
-
-The bridge streams:
-
-- binary image frames for the simulator view
-- JSON snapshots for the accessibility tree
-- JSON responses for point inspection and control messages
-
-## Transport Behavior
-
-In `Auto` video mode:
-
-- Inspect mode uses `simctl` screenshots for tighter AX/frame alignment.
-- Interaction mode uses ScreenCaptureKit when available for smoother live video.
-- If ScreenCaptureKit cannot start, the bridge falls back to `simctl` screenshots.
-
-You can also force `CaptureKit` or `simctl` from the UI.
-
-## Bridge Configuration
-
-Environment variables:
-
-
-| Var                 | Default | Purpose                                           |
-| ------------------- | ------- | ------------------------------------------------- |
-| `PORT`              | `7878`  | WebSocket / health server port                    |
-| `FRAME_MS`          | `120`   | Screenshot cadence for the `simctl` fallback      |
-| `FRAME_FORMAT`      | `jpeg`  | Screenshot encoding: `jpeg` or `png`              |
-| `CAPTURE_FPS`       | `50`    | Target ScreenCaptureKit frame rate                |
-| `CAPTURE_QUALITY`   | `0.7`   | JPEG quality for ScreenCaptureKit frames          |
-| `CAPTURE_MAX_WIDTH` | `1200`  | Max streamed frame width                          |
-| `CAPTURE=0`         | unset   | Disable ScreenCaptureKit and use screenshots only |
-
-
-## Good Fits
-
-`sim-grab` is especially useful for:
-
-- agent-assisted debugging sessions
-- UI inspection without source access
-- pairing with Cursor, Codex, or Claude on iOS tasks
-- quickly checking what an app is actually exposing via accessibility
-
-## Current Limitations
-
-- The underlying AX tree can still collapse some grouped controls, especially complex nav and tab bars.
-- The latent DOM mirror can only expose what the simulator accessibility APIs provide.
-- If `idb` is unavailable or unstable, point inspection and input control will degrade or stop working.
+- Troubleshooting and implementation notes: [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
